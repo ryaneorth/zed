@@ -64,6 +64,7 @@ func Run() {
 	registerValidateCmd(rootCmd)
 	registerBackupCmd(rootCmd)
 	registerRestoreCmd(rootCmd)
+	registerDestroyCmd(rootCmd)
 
 	// Register shared commands.
 	commands.RegisterPermissionCmd(rootCmd)
