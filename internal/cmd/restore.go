@@ -22,6 +22,7 @@ func registerRestoreCmd(rootCmd *cobra.Command) {
 	restoreCmd.Flags().Int("batch-size", 1_000, "restore relationship write batch size")
 	restoreCmd.Flags().Int("batches-per-transaction", 10, "number of batches per transaction")
 	restoreCmd.Flags().Bool("print-zedtoken-only", false, "just print the zedtoken and stop")
+	restoreCmd.Flags().Int("start-on-relationship", 0, "skips the first n relationships")
 }
 
 var restoreCmd = &cobra.Command{
@@ -66,12 +67,10 @@ func restoreCmdFunc(cmd *cobra.Command, args []string) error {
 
 	printZTOnly := cobrautil.MustGetBool(cmd, "print-zedtoken-only")
 
-	var hasProgressbar bool
 	var restoreReader io.Reader = f
 	if isatty.IsTerminal(os.Stderr.Fd()) && !printZTOnly {
 		bar := progressbar.DefaultBytes(fSize, "restoring")
 		restoreReader = io.TeeReader(f, bar)
-		hasProgressbar = true
 	}
 
 	decoder, err := backupformat.NewDecoder(restoreReader)
@@ -113,49 +112,65 @@ func restoreCmdFunc(cmd *cobra.Command, args []string) error {
 	batchSize := cobrautil.MustGetInt(cmd, "batch-size")
 	batchesPerTransaction := cobrautil.MustGetInt(cmd, "batches-per-transaction")
 
-	batch := make([]*v1.Relationship, 0, batchSize)
+	transactionRels := make([]*v1.Relationship, 0, batchSize*batchesPerTransaction)
 	var written uint64
 	var batchesWritten int
+
+	defer func() {
+		totalTime := time.Since(relationshipWriteStart)
+		relsPerSec := float64(written) / totalTime.Seconds()
+
+		log.Info().
+			Uint64("relationships", written+uint64(cobrautil.MustGetInt(cmd, "start-on-relationship"))).
+			Stringer("duration", totalTime).
+			Float64("perSecond", relsPerSec).
+			Msg("finished restore")
+	}()
+
+	relationshipsToSkip := cobrautil.MustGetInt(cmd, "start-on-relationship")
 	for rel, err := decoder.Next(); rel != nil && err == nil; rel, err = decoder.Next() {
+		if relationshipsToSkip > 0 {
+			relationshipsToSkip--
+			continue
+		}
+
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("aborted restore: %w", err)
 		}
 
-		batch = append(batch, rel)
+		transactionRels = append(transactionRels, rel)
 
-		if len(batch)%batchSize == 0 {
-			if err := relationshipWriter.Send(&v1.BulkImportRelationshipsRequest{
-				Relationships: batch,
-			}); err != nil {
-				return fmt.Errorf("error sending batch to server: %w", err)
+		if len(transactionRels)%batchSize*batchesPerTransaction == 0 {
+			transBatchesWritten, transWritten, err := writeTransaction(cmd, relationshipWriter, transactionRels)
+			if err != nil {
+				for i := 0; i < 5 && err != nil; i++ {
+					// sleep for n seconds and retry
+					time.Sleep(time.Duration(i) * time.Second)
+					log.Error().Err(err).Msg("error writing transaction, retrying")
+					relationshipWriter, err = client.BulkImportRelationships(ctx)
+					if err != nil {
+						return fmt.Errorf("error creating new writer stream: %w", err)
+					}
+					transBatchesWritten, transWritten, err = writeTransaction(cmd, relationshipWriter, transactionRels)
+				}
+				if err != nil {
+					return err
+				}
 			}
-
-			// Reset the relationships in the batch
-			batch = batch[:0]
-
-			batchesWritten++
-
-			if batchesWritten%batchesPerTransaction == 0 {
-				resp, err := relationshipWriter.CloseAndRecv()
-				if err != nil {
-					return fmt.Errorf("error finalizing write of %d batches: %w", batchesPerTransaction, err)
-				}
-				if !hasProgressbar {
-					log.Debug().Uint64("relationships", written).Msg("relationships written")
-				}
-				written += resp.NumLoaded
-
-				relationshipWriter, err = client.BulkImportRelationships(ctx)
-				if err != nil {
-					return fmt.Errorf("error creating new writer stream: %w", err)
-				}
+			// Reset the relationships for the next transaction
+			transactionRels = transactionRels[:0]
+			batchesWritten += transBatchesWritten
+			written += transWritten
+			relationshipWriter, err = client.BulkImportRelationships(ctx)
+			if err != nil {
+				return fmt.Errorf("error creating new writer stream: %w", err)
 			}
 		}
 	}
 
 	// Write the last batch
 	if err := relationshipWriter.Send(&v1.BulkImportRelationshipsRequest{
-		Relationships: batch,
+		Relationships: transactionRels,
 	}); err != nil {
 		return fmt.Errorf("error sending last batch to server: %w", err)
 	}
@@ -165,17 +180,7 @@ func restoreCmdFunc(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("error finalizing last write: %w", err)
 	}
-
 	written += resp.NumLoaded
-
-	totalTime := time.Since(relationshipWriteStart)
-	relsPerSec := float64(written) / totalTime.Seconds()
-
-	log.Info().
-		Uint64("relationships", written).
-		Stringer("duration", totalTime).
-		Float64("perSecond", relsPerSec).
-		Msg("finished restore")
 
 	if err := decoder.Close(); err != nil {
 		return fmt.Errorf("error closing restore encoder: %w", err)
@@ -186,4 +191,45 @@ func restoreCmdFunc(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func writeTransaction(cmd *cobra.Command, relationshipWriter v1.ExperimentalService_BulkImportRelationshipsClient, rels []*v1.Relationship) (int, uint64, error) {
+	batchSize := cobrautil.MustGetInt(cmd, "batch-size")
+	batchesPerTransaction := cobrautil.MustGetInt(cmd, "batches-per-transaction")
+
+	var batchesWritten int
+	var written uint64
+	batch := make([]*v1.Relationship, 0, batchSize)
+
+	for _, rel := range rels {
+		batch = append(batch, rel)
+
+		if len(batch)%batchSize == 0 {
+			if err := relationshipWriter.Send(&v1.BulkImportRelationshipsRequest{
+				Relationships: batch,
+			}); err != nil {
+				return batchesWritten, written, fmt.Errorf("error sending batch to server: %w", err)
+			}
+
+			// Reset the relationships in the batch
+			batch = batch[:0]
+
+			batchesWritten++
+
+			if batchesWritten%batchesPerTransaction == 0 {
+				resp, err := relationshipWriter.CloseAndRecv()
+				if err != nil {
+					return batchesWritten, written, fmt.Errorf("error finalizing write of %d batches: %w", batchesPerTransaction, err)
+				}
+
+				written += resp.NumLoaded
+
+				//relationshipWriter, err = client.BulkImportRelationships(ctx)
+				if err != nil {
+					return batchesWritten, written, fmt.Errorf("error creating new writer stream: %w", err)
+				}
+			}
+		}
+	}
+	return batchesWritten, written, nil
 }
